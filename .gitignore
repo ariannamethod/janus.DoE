@@ -1,0 +1,26 @@
+m
+m_blas
+m_cublas
+m_test
+m_data.txt
+small_data.txt
+*.gguf
+mycelium/*.gguf
+mycelium/meta.log
+blood_system.log
+*.o
+*.bin
+m_bpe.cache
+logs/
+.DS_Store
+
+# hand-written DoE corpus — kept local, never public
+doe_dataset.jsonl
+doe_dataset_merged.jsonl
+doe_personality.txt
+personality.txt
+personality_sft.txt
+*.jsonl
+
+# host weights — fetched via `make weights`, never committed
+weights/
