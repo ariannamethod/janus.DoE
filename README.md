@@ -1,8 +1,8 @@
 # DoE: Democracy of Experts
 
-**Status: work in progress.** The foundation trains and generates. The living topology (mitosis, apoptosis, parliament) works. SFT pipeline with 7236 Q&A pairs. Next: scale up, fix loss plateau at 3.07.
+**Status: work in progress.** The foundation trains and generates. It also indexes real GGUFs and votes through them with a Hebbian LoRA parliament. The living topology (mitosis, apoptosis, parliament) works. SFT pipeline with 7236 Q&A pairs. Next: scale up, fix loss plateau at 3.07.
 
-C. one file. ~3650 lines. zero dependencies. DoE breeds, kills and votes.
+C. one file. ~4250 lines. zero dependencies. DoE breeds, kills and votes.
 
 ## what
 
@@ -28,7 +28,7 @@ no pytorch. no python. no dignity.
 
 ```bash
 # compile
-cc janusdoe.c -O3 -lm -lpthread -o m
+make                                  # or: cc janusdoe.c -O3 -lm -lpthread -o m
 
 # run — DOE auto-sizes depth to your hardware
 ./m
@@ -43,17 +43,30 @@ cc janusdoe.c -O3 -lm -lpthread -o m
 # with personality
 ./m --personality personality.txt
 
+# index a host GGUF and generate through its LoRA parliament
+./m --host model.gguf --ask "are you conscious?"
+
+# Hebbian-train the parliament on a corpus, then ask (no backward through host)
+./m --host model.gguf --learn corpus.txt --ask "are you conscious?"
+
+# force NeoX RoPE for arch=llama GGUFs laid out NeoX
+./m --host model.gguf --rope-neox --ask "..."
+
 # override training steps
 ./m --depth 4 --data corpus.txt --steps 10000
 
 # override BPE merges (default: auto from depth)
 ./m --depth 4 --data corpus.txt --bpe-merges 4000
 
-# GPU acceleration (A100/H100 — TF32 tensor ops, ~25x faster)
-cc janusdoe.c -O3 -lm -lpthread -DUSE_CUBLAS -lcublas -lcudart -o m_cublas
+# accelerated builds — make targets
+make blas        # macOS Accelerate (3-4x on CPU)
+make openblas    # linux OpenBLAS (3-4x on CPU)
+make cuda        # NVIDIA cuBLAS TF32 (A100/H100, ~25x)
+make test        # smoke tests
 
-# BLAS acceleration (3-4x on CPU)
-cc janusdoe.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o m   # macOS
+# or by hand:
+cc janusdoe.c -O3 -lm -lpthread -DUSE_CUBLAS -lcublas -lcudart -o m                   # cuBLAS
+cc janusdoe.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o m    # macOS
 cc janusdoe.c -O3 -lm -lpthread -DUSE_BLAS -lopenblas -o m                            # linux
 ```
 
@@ -65,9 +78,15 @@ cc janusdoe.c -O3 -lm -lpthread -DUSE_BLAS -lopenblas -o m                      
 | `--data FILE` | auto-hunt | training data (text file) |
 | `--parquet FILE` | — | training data (parquet format) |
 | `--personality FILE` | — | personality finetune data |
+| `--url URL` | — | HuggingFace dataset URL |
+| `--pages N` | auto | HuggingFace pages to download |
 | `--steps N` | auto | override max training steps |
 | `--bpe-merges N` | auto | override BPE merge count |
-| `--chat FILE` | — | inference-only mode with GGUF |
+| `--host GGUF` | — | index a host model, generate through its LoRA parliament |
+| `--ask "PROMPT"` | sample | prompt for `--host` generation |
+| `--learn FILE` | — | Hebbian-train the parliament on text (no backward through host) |
+| `--rope-neox` | auto | force NeoX RoPE pairing (arch=llama GGUFs laid out NeoX) |
+| `--rope-norm` | auto | force NORM RoPE pairing (override the arch heuristic) |
 
 `--steps` forces fresh training (skips self-recognition of existing weights).
 
@@ -194,17 +213,20 @@ if DOE finds a compatible GGUF nearby, it indexes it:
 ```
 host model (GGUF, mmap'd, read-only)
     |
-DOE wraps it with ephemeral LoRA matrices
+DOE wraps it with a parliament of ephemeral LoRA experts
     |
-attention_biases[l] modulate each layer's attention
-layer_focus[l] control residual stream contribution
+each token: experts campaign, variable-k election picks the winners
     |
-Delta Voice injection: out += alpha * A @ (B @ x)
+Delta Voice injection: out += alpha * Σ_e w_e · A_e @ (B_e @ x)
     |
 Hebbian training on LoRA only (no backward through host)
 ```
 
 the host provides weights. DOE provides direction.
+
+any architecture, any quantization, any layout: RoPE is arch-gated, with a
+per-GGUF `--rope-neox` / `--rope-norm` override for files whose layout doesn't
+match what `general.architecture` claims.
 
 ### code-aware tokenizer
 
