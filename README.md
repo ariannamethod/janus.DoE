@@ -3,7 +3,7 @@
 **Status: work in progress.** The foundation trains and generates. It also indexes real GGUFs and votes through them with a Hebbian LoRA parliament. The living topology (mitosis, apoptosis, parliament) works. SFT pipeline with 7236 Q&A pairs. Next: scale up, fix loss plateau at 3.07.
 
 C. one file. ~4250 lines. zero dependencies. DoE breeds, kills and votes.
-
+ 
 ## what
 
 a transformer where experts are born, die, and hold elections:
