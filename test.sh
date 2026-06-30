@@ -80,9 +80,6 @@ fi
 grep -q "\[env\] cpu=" test_output.txt && ok "environment scan" || fail "no env scan"
 grep -q "compiler=" test_output.txt && ok "compiler detection" || fail "no compiler detect"
 
-# ═══ Symbiont System ═══
-grep -q "\[symbiont\]" test_output.txt && ok "symbiont system" || fail "no symbiont"
-
 # ═══ Code Detection ═══
 grep -q "code=" test_output.txt && ok "code detection" || fail "no code detect"
 

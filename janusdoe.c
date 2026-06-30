@@ -143,6 +143,8 @@ typedef struct {
     int batch_size, max_steps, warmup_steps, log_every, bpe_merges, personality_steps, hf_pages;
     int explicit_steps;  /* 1 if --steps was given on CLI */
     int explicit_data;   /* 1 if --data was given on CLI */
+    int active_depth;    /* layers executed per forward (ephemeral; <= depth) */
+    float vitality_threshold;  /* ephemeral low-vitality cutoff for apoptosis counting */
     char data_url[512], data_path[256], gguf_path[256], personality_path[256];
 } Config;
 
@@ -170,11 +172,12 @@ static Config config_from_depth(int depth) {
     c.weight_decay = 0.01f; c.log_every = 20;
     /* max_steps computed later from actual token count — see post-tokenization */
     c.max_steps = 0; /* 0 = auto from data */
-    c.bpe_merges = 4000; c.personality_steps = 0; /* 0 = auto from personality size */
+    c.bpe_merges = depth <= 4 ? 2000 : depth <= 8 ? 4000 : 8000; /* auto from depth (README); --bpe-merges overrides */
+    c.active_depth = depth; c.vitality_threshold = 0.1f; c.personality_steps = 0; /* 0 = auto from personality size */
     c.explicit_steps = 0; c.explicit_data = 0;
     /* Auto HF pages from depth: need ~30 tok/param, ~0.5MB per page, tok≈bytes/3 */
     c.hf_pages = (depth <= 2) ? 120 : (depth <= 4) ? 500 : (depth <= 8) ? 4000 : 10000;
-    snprintf(c.data_url, 512, "fineweb-edu");
+    snprintf(c.data_url, 512, "HuggingFaceFW/fineweb-edu");
     snprintf(c.data_path, 256, "m_data.txt");
     snprintf(c.gguf_path, 256, "m.gguf");
     snprintf(c.personality_path, 256, "personality.txt");
@@ -274,12 +277,15 @@ static int tok_load_merges(Tokenizer *tok, const char *path) {
     if (!f) return 0;
     int nm = 0;
     if (fscanf(f, "%d\n", &nm) != 1 || nm <= 0) { fclose(f); return 0; }
+    if (nm > TOK_MAX_VOCAB) nm = TOK_MAX_VOCAB;   /* bound merges to vocab capacity */
     if (tok->merges) free(tok->merges);
     tok->merges = calloc(nm, sizeof(MergePair));
+    if (!tok->merges) { fclose(f); return 0; }
     tok->n_merges = 0;
     for (int i = 0; i < nm; i++) {
         char a[64], b[64];
         if (fscanf(f, "%63s\t%63s\n", a, b) != 2) break;
+        if (tok->vocab_size >= TOK_MAX_VOCAB) break;   /* vocab full — stop adding merges */
         strncpy(tok->merges[i].a, a, 63);
         strncpy(tok->merges[i].b, b, 63);
         /* Rebuild vocab: add merged token */
@@ -296,16 +302,71 @@ static int tok_load_merges(Tokenizer *tok, const char *path) {
     return tok->n_merges > 0;
 }
 
+/* ═══ TOKENIZER CACHE — the tokenizer remembers what it ate (encode memoization) ═══ */
+#define TOKCACHE_CAP 1024
+#define TOKCACHE_MAX_LEN 128
+typedef struct { uint64_t hash; char *text; int *ids; int n_ids; int text_len; int hits; int alive; } TokCacheEntry;
+typedef struct { TokCacheEntry entries[TOKCACHE_CAP]; int total_hits; int total_misses; float hit_rate; int vocab_size; } TokCache;
+static void tokcache_init(TokCache *tc, int vocab_size) {
+    memset(tc, 0, sizeof(TokCache));
+    tc->vocab_size = vocab_size;
+}
+static uint64_t tokcache_hash(const char *text, int len) {
+    uint64_t h = 14695981039346656037ULL;
+    for (int i = 0; i < len; i++) { h ^= (uint64_t)(unsigned char)text[i]; h *= 1099511628211ULL; }
+    return h;
+}
+static int *tokcache_lookup(TokCache *tc, const char *text, int len, int *n_ids) {
+    if (len > TOKCACHE_MAX_LEN || len == 0) return NULL;
+    uint64_t h = tokcache_hash(text, len);
+    int idx = (int)(h % TOKCACHE_CAP);
+    for (int probe = 0; probe < 8; probe++) {
+        int i = (idx + probe) % TOKCACHE_CAP;
+        if (tc->entries[i].alive && tc->entries[i].hash == h && tc->entries[i].text_len == len && memcmp(tc->entries[i].text, text, len) == 0) {
+            tc->entries[i].hits++; tc->total_hits++;
+            tc->hit_rate = 0.95f * tc->hit_rate + 0.05f;
+            *n_ids = tc->entries[i].n_ids; return tc->entries[i].ids;
+        }
+    }
+    tc->total_misses++; tc->hit_rate = 0.95f * tc->hit_rate; return NULL;
+}
+static void tokcache_insert(TokCache *tc, const char *text, int len, int *ids, int n_ids) {
+    if (len > TOKCACHE_MAX_LEN || len == 0 || n_ids <= 0) return;
+    uint64_t h = tokcache_hash(text, len);
+    int idx = (int)(h % TOKCACHE_CAP);
+    int target = idx; int min_hits = tc->entries[idx].alive ? tc->entries[idx].hits : -1;
+    for (int probe = 0; probe < 8; probe++) {
+        int i = (idx + probe) % TOKCACHE_CAP;
+        if (!tc->entries[i].alive) { target = i; break; }
+        if (tc->entries[i].hits < min_hits) { min_hits = tc->entries[i].hits; target = i; }
+    }
+    TokCacheEntry *e = &tc->entries[target];
+    if (e->alive) { free(e->ids); free(e->text); }
+    e->hash = h; e->text_len = len; e->hits = 0; e->alive = 1; e->n_ids = n_ids;
+    e->ids = malloc(n_ids * sizeof(int)); memcpy(e->ids, ids, n_ids * sizeof(int));
+    e->text = malloc(len); memcpy(e->text, text, len);   /* keep the key to reject hash collisions */
+}
+static TokCache g_tokcache; static int g_tokcache_ready = 0;
+
 static int*tok_encode(Tokenizer*tok,const char*text,int tl,int*out_len){
+    if (!g_tokcache_ready) { tokcache_init(&g_tokcache, tok->vocab_size); g_tokcache_ready = 1; }
+    { int hn; int *h = tokcache_lookup(&g_tokcache, text, tl, &hn);
+      if (h) { int *cp = malloc(hn*sizeof(int)); memcpy(cp, h, hn*sizeof(int)); *out_len = hn; return cp; } }
     SegArr segs=unicode_segment(text,tl);int*ids=NULL;int ni=0,ci=0;
     for(int s=0;s<segs.len;s++){StrArr sy={0};for(int b=0;b<segs.segs[s].len;b++){char h[8];snprintf(h,8,"0x%02x",segs.segs[s].data[b]);sa_push(&sy,h);}
     if(tok->n_merges>0&&sy.len>=2){int ch=1;while(ch&&sy.len>=2){ch=0;int br=tok->n_merges,bp=-1;for(int i=0;i<sy.len-1;i++)for(int m=0;m<br;m++)if(strcmp(sy.items[i],tok->merges[m].a)==0&&strcmp(sy.items[i+1],tok->merges[m].b)==0){br=m;bp=i;break;}if(bp>=0){char nt[128];snprintf(nt,128,"%s+%s",tok->merges[br].a,tok->merges[br].b);StrArr mg={0};for(int i=0;i<sy.len;i++){if(i==bp){sa_push(&mg,nt);i++;}else sa_push(&mg,sy.items[i]);}sa_free(&sy);sy=mg;ch=1;}}}
     for(int i=0;i<sy.len;i++){int id=stoi_get(&tok->stoi,sy.items[i]);if(id<0)id=0;if(ni>=ci){ci=ci?ci*2:256;ids=realloc(ids,sizeof(int)*ci);}ids[ni++]=id;}sa_free(&sy);}
+    tokcache_insert(&g_tokcache, text, tl, ids, ni);
     seg_free(&segs);*out_len=ni;return ids;
 }
 
 static char*tok_decode(Tokenizer*tok,int*ids,int ni,int*out_len){
-    char*buf=malloc(ni*8+1);int pos=0;
+    /* first pass: count decoded bytes (one per "0xNN" group) — a merge token can decode
+     * to far more than 8 bytes, so size the buffer exactly instead of the old ni*8. */
+    size_t cap=0;
+    for(int i=0;i<ni;i++){if(ids[i]<0||ids[i]>=tok->vocab_size)continue;if(ids[i]==tok->bos_id||ids[i]==tok->eos_id)continue;
+        const char*cp=tok->tokens[ids[i]];while(*cp){if(cp[0]=='0'&&cp[1]=='x'){cap++;cp+=4;if(*cp=='+')cp++;}else cp++;}}
+    char*buf=malloc(cap+1);int pos=0;
     for(int i=0;i<ni;i++){if(ids[i]<0||ids[i]>=tok->vocab_size)continue;if(ids[i]==tok->bos_id||ids[i]==tok->eos_id)continue;
     const char*nm=tok->tokens[ids[i]];const char*p=nm;while(*p){if(p[0]=='0'&&p[1]=='x'){unsigned int bv;if(sscanf(p,"0x%02x",&bv)==1)buf[pos++]=(char)bv;p+=4;if(*p=='+')p++;}else p++;}}
     buf[pos]='\0';*out_len=pos;return buf;
@@ -425,7 +486,6 @@ static void tfree(Tensor*t){if(t){
     if(t->d_data)cudaFree(t->d_data);
 #endif
     free(t->data);free(t);}}
-static Tensor *tclone(Tensor *src){Tensor*t=calloc(1,sizeof(Tensor));t->data=malloc(src->size*sizeof(float));memcpy(t->data,src->data,src->size*sizeof(float));t->size=src->size;t->rows=src->rows;t->cols=src->cols;return t;}
 /* Mark tensor as dirty — GPU copy needs re-upload after adam step */
 static void tmark_dirty(Tensor*t){
 #ifdef USE_CUBLAS
@@ -590,6 +650,7 @@ typedef struct {
     float consensus;        /* 0=chaos, 1=unanimous. computed per-token average */
     float faction_power[MAX_EXPERTS]; /* accumulated influence */
     int election_count;
+    float temperature;      /* ephemeral vote sharpness (1=neutral); set per step from expert_temperature */
 } Parliament;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -764,11 +825,12 @@ static int parliament_elect(Parliament *p, Expert *experts, float *input, int di
         weights[ki] = votes[bi];
         used[bi] = 1;
     }
-    /* Softmax over selected */
+    /* Softmax over selected — temperature modulates vote sharpness (ephemeral expert_temperature) */
+    float temp = (p->temperature > 0.05f) ? p->temperature : 1.0f;
     float mx = weights[0];
     for (int i = 1; i < k; i++) if (weights[i] > mx) mx = weights[i];
     float sum = 0;
-    for (int i = 0; i < k; i++) { weights[i] = expf(weights[i] - mx); sum += weights[i]; }
+    for (int i = 0; i < k; i++) { weights[i] = expf((weights[i] - mx) / temp); sum += weights[i]; }
     for (int i = 0; i < k; i++) weights[i] /= sum;
 
     p->election_count++;
@@ -819,7 +881,9 @@ static float *forward_token(ModelW *w, Config *c, RunState *s, int token, int po
     int hg = c->n_heads / c->n_kv_heads; float sc = 1.0f / sqrtf((float)hd);
     memcpy(s->x, w->tok_emb->data + token * D, D * sizeof(float));
 
-    for (int l = 0; l < c->depth; l++) {
+    /* dynamic depth: each forward runs only the ephemeral active_layers (README: "how deep to go") */
+    int adepth = (c->active_depth > 0 && c->active_depth <= c->depth) ? c->active_depth : c->depth;
+    for (int l = 0; l < adepth; l++) {
         LayerW *lw = &w->layers[l];
         /* Attention */
         rmsnorm(s->xb, s->x, lw->attn_norm->data, D, c->norm_eps);
@@ -1199,7 +1263,7 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
             float dot_wd = 0;
             for (int ki = 0; ki < k; ki++) dot_wd += tw[ki] * dw_buf[ki];
             for (int ki = 0; ki < k; ki++) {
-                dvote_buf[ki] = tw[ki] * (dw_buf[ki] - dot_wd);
+                dvote_buf[ki] = tw[ki] * (dw_buf[ki] - dot_wd) / ((lw->parliament.temperature > 0.05f) ? lw->parliament.temperature : 1.0f);   /* match forward softmax(v/temperature) */
                 int eI = ti[ki];
                 /* gradient to w_vote and to input */
                 float *vote_row = lw->parliament.w_vote->data + eI * D;
@@ -1216,7 +1280,7 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
               float dot_aux = 0;
               for (int ki = 0; ki < k; ki++) dot_aux += tw[ki] * daux[ki];
               for (int ki = 0; ki < k; ki++) {
-                float dv = tw[ki] * (daux[ki] - dot_aux);
+                float dv = tw[ki] * (daux[ki] - dot_aux) / ((lw->parliament.temperature > 0.05f) ? lw->parliament.temperature : 1.0f);
                 int eI = ti[ki];
                 float *vote_row = lw->parliament.w_vote->data + eI * D;
                 for (int j = 0; j < D; j++) {
@@ -1343,7 +1407,7 @@ static long count_params(ModelW *w, Config *c) {
  * overloaded expert + high vitality → splits into two (mitosis).
  * child inherits parent weights + gaussian noise. frequency offset.
  * neglected expert → vitality drops → 8 consecutive low steps → dies (apoptosis).
- * frequency gaps get filled by new experts born at resonance peaks.
+ * the most generalist expert splits; the child gets a frequency offset.
  * this is cellular biology applied to mixture-of-experts.
  * the immune system is the harmonic backbone.
  * ═══════════════════════════════════════════════════════════════════════════════ */
@@ -1362,28 +1426,37 @@ static void update_vitality(LayerW *lw, Config *c, int total_tokens) {
         exp->vitality = fmaxf(0.0f, fminf(1.0f, exp->vitality));
         exp->age++;
         /* Track low vitality for apoptosis */
-        if (exp->vitality < 0.1f) exp->low_vitality_count++;
+        if (exp->vitality < c->vitality_threshold) exp->low_vitality_count++;
         else exp->low_vitality_count = 0;
+        /* Harmonic: roll the per-step activation history (read below + by harmonic analysis) */
+        exp->entropy_hist[exp->eh_pos % 16] = exp->vitality; exp->eh_pos++;
+        /* Specialization = Shannon surprisal of this expert's usage share + activation variance:
+         * low usage / steady activation ⇒ specialized; high usage / volatile ⇒ generalist. */
+        float share = (total_tokens > 0) ? (float)exp->tokens_seen / (float)total_tokens : 0.0f;
+        float ehm = 0; for (int h = 0; h < 16; h++) ehm += exp->entropy_hist[h]; ehm /= 16.0f;
+        float ehv = 0; for (int h = 0; h < 16; h++) { float d = exp->entropy_hist[h] - ehm; ehv += d*d; } ehv /= 16.0f;
+        exp->specialization = ((share > 1e-6f) ? -share * logf(share) : 0.0f) + ehv;
         /* Reset tokens_seen for next step */
         exp->tokens_seen = 0;
     }
     lw->n_alive = n_alive;
 }
 
-static int try_mitosis(LayerW *lw, Config *c, int total_tokens) {
+static int try_mitosis(LayerW *lw, Config *c) {
     /* Find overloaded expert with high vitality */
     int n_alive = 0;
     for (int e = 0; e < MAX_EXPERTS; e++) if (lw->experts[e].alive) n_alive++;
     if (n_alive >= MAX_EXPERTS) return 0;
 
-    float fair_share = (float)total_tokens / (n_alive > 0 ? n_alive : 1);
-    int parent = -1;
+    int parent = -1; float best_score = -1e9f;
     for (int e = 0; e < MAX_EXPERTS; e++) {
         if (!lw->experts[e].alive) continue;
         Expert *exp = &lw->experts[e];
-        /* overloaded (tokens >> avg) + high vitality + old enough */
-        if (exp->vitality > 0.8f && exp->age > 20) {
-            parent = e; break;
+        /* overloaded (high vitality) + old enough; among those, split the most GENERALIST
+         * (highest vitality, lowest specialization) — specialists are preserved, not cloned. */
+        if (exp->vitality > 0.8f && exp->age >= 20) {
+            float score = exp->vitality - exp->specialization;
+            if (score > best_score) { best_score = score; parent = e; }
         }
     }
     if (parent < 0) return 0;
@@ -1410,34 +1483,18 @@ static int try_mitosis(LayerW *lw, Config *c, int total_tokens) {
     return 1;
 }
 
-static int try_apoptosis(LayerW *lw) {
-    int n_alive = 0;
-    for (int e = 0; e < MAX_EXPERTS; e++) if (lw->experts[e].alive) n_alive++;
-    if (n_alive <= MIN_EXPERTS) return 0;
-
-    for (int e = 0; e < MAX_EXPERTS; e++) {
-        if (!lw->experts[e].alive) continue;
-        if (lw->experts[e].low_vitality_count >= 8) {
-            free_expert(&lw->experts[e]);
-            lw->n_alive--;
-            return 1;
-        }
-    }
-    return 0;
-}
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * CHUCK OPTIMIZER — 9 levels of self-awareness. from lee.c, adapted.
  * the optimizer that thinks about thinking about optimizing.
- * Level 1: global loss trend. Level 2: per-layer grad norm.
- * Level 3: stagnation escape. Level 4: activation health.
- * Level 5: cross-layer signal. Level 6: Ψ subjectivity.
- * Level 7: attention entropy. Level 9: macro patience.
+ * 9 self-awareness mechanisms, all live in chuck_step: (1) loss-trend dampening,
+ * (2) stagnation-escape noise, (3) macro-patience lr decay, (4) activation health
+ * from the eyes, (5) Ψ subjectivity / memory recall, (6) adaptive gradient
+ * clipping, (7) global gradient clipping, (8) Ψ-recall λ (eff_lambda), (9) grad-norm EMA.
  * ═══════════════════════════════════════════════════════════════════════════════ */
-typedef struct { float grad_hist[CHUCK_WINDOW]; int pos, full, stag; float dampen; int frozen; } ChuckLayer;
 typedef struct {
     float hist[CHUCK_WINDOW]; float loss_ema, gnorm_ema;
-    float dampen, noise, sigma, psi, psi_w;
+    float dampen, noise, sigma, psi, psi_w, eff_lambda;
     float macro_ema, best_macro, lr_scale;
     int macro_stag, macro_drops;
     int pos, full, stag, global_step;
@@ -1467,8 +1524,8 @@ static float chuck_mem_recall(float loss, float gnorm) {
     return chuck_mem[best_i].lambda;
 }
 
-static void chuck_step(ChuckState *ck, ChuckLayer *cl, int n_layers, float lr, float loss,
-                       ParamList *params, float **grads, float wd,
+static void chuck_step(ChuckState *ck, float loss,
+                       ParamList *params, float **grads,
                        TokenizerEye *tok_eye, ParserEye *parser_eye) {
     /* ═══ Level 1: Global self-awareness (loss trend) ═══ */
     if (ck->loss_ema == 0) ck->loss_ema = loss;
@@ -1526,23 +1583,18 @@ static void chuck_step(ChuckState *ck, ChuckLayer *cl, int n_layers, float lr, f
         if (ck->global_step % CHUCK_REC_CD == 0) chuck_mem_save(&snap);
     }
 
-    /* ═══ Adaptive gradient clipping ═══ */
+
+    /* ═══ Apply Adam with Chuck modulation ═══ */
+    ck->eff_lambda = lambda_psi;   /* psi-recall-adjusted dampen — consumed by the real update step */
+    /* ═══ Level 5: adaptive gradient clipping — threshold tracks the running grad-norm EMA ═══ */
     if (ck->gnorm_ema == 0) ck->gnorm_ema = gnorm;
     else ck->gnorm_ema = 0.97f * ck->gnorm_ema + 0.03f * gnorm;
     float adaptive_clip = fmaxf(0.5f, fminf(2.0f, 1.5f * ck->gnorm_ema));
     if (gnorm > 3.0f * ck->gnorm_ema) adaptive_clip *= 0.5f;
-    float clip = (gnorm > adaptive_clip) ? adaptive_clip / gnorm : 1.0f;
-
-    /* ═══ Apply Adam with Chuck modulation ═══ */
-    float eff_lr = lr * lambda_psi * ck->sigma * ck->lr_scale;
-/* REMOVED: per-tensor clipping — causes double clip with global. See moe.c audit 2026-03-05 */
-/* REMOVED: per-tensor clipping — causes double clip with global. See moe.c audit 2026-03-05 */
-/* REMOVED: per-tensor clipping — causes double clip with global. See moe.c audit 2026-03-05 */
-/* REMOVED: per-tensor clipping — causes double clip with global. See moe.c audit 2026-03-05 */
-/* REMOVED: per-tensor clipping — causes double clip with global. See moe.c audit 2026-03-05 */
-    /* Global clipping */
     float gn = 0; for (int i = 0; i < params->count; i++) for (int j = 0; j < params->tensors[i]->size; j++) gn += grads[i][j] * grads[i][j]; gn = sqrtf(gn);
-    if (gn > 1.0f) { float s = 1.0f / gn; for (int i = 0; i < params->count; i++) for (int j = 0; j < params->tensors[i]->size; j++) grads[i][j] *= s; }
+    if (gn > adaptive_clip) { float s = adaptive_clip / gn; for (int i = 0; i < params->count; i++) for (int j = 0; j < params->tensors[i]->size; j++) grads[i][j] *= s; }
+    /* (2) stagnation-escape noise — kick gradients out of a plateau (ck->noise decays back to 0) */
+    if (ck->noise > 1e-6f) for (int i = 0; i < params->count; i++) for (int j = 0; j < params->tensors[i]->size; j++) grads[i][j] += ck->noise * rand_normal();
 }
 
 /* Adam optimizer state */
@@ -1572,36 +1624,6 @@ static void adam_step(Adam *o, ParamList *p, float **g, float lr, float wd) {
     }
 }
 static void adam_free(Adam*o){if(!o)return;for(int i=0;i<o->np;i++){free(o->states[i].m);free(o->states[i].v);}free(o->states);free(o);}
-
-/* ═══════════════════════════════════════════════════════════════════════════════
- * NOTORCH — Hebbian micro-learning between batches. from AML core.
- * A[i,r] += lr * x[i] * u[r] * signal. low-rank delta update.
- * plasticity that never stops. the brain doesn't batch either.
- * ═══════════════════════════════════════════════════════════════════════════════ */
-static void notorch_step(float *A, float *B, int out_dim, int in_dim, int rank,
-                         const float *x, const float *dy, float signal) {
-    if (fabsf(signal) < 1e-8f) return;
-    float lr = 0.001f * signal;
-    /* Compute channel vector u = B^T @ dy (rank-dimensional) */
-    float u[NOTORCH_RANK];
-    for (int r = 0; r < rank && r < NOTORCH_RANK; r++) {
-        float s = 0;
-        for (int i = 0; i < out_dim; i++) s += B[i * rank + r] * dy[i];
-        u[r] = s + rand_normal() * 0.01f; /* noise channel */
-    }
-    /* Hebbian update: A[i,r] += lr * x[i] * u[r] */
-#ifdef USE_BLAS
-    for (int r = 0; r < rank && r < NOTORCH_RANK; r++)
-        cblas_saxpy(in_dim, lr * u[r], x, 1, A + r, rank);
-#else
-    for (int i = 0; i < in_dim; i++)
-        for (int r = 0; r < rank && r < NOTORCH_RANK; r++)
-            A[i * rank + r] += lr * x[i] * u[r];
-#endif
-    /* Adaptive decay */
-    float decay = 0.999f;
-    for (int i = 0; i < out_dim * rank; i++) B[i] *= decay;
-}
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * DATA — HF API, parquet, synthetic. same three sources as moe.c.
@@ -1710,13 +1732,17 @@ static int load_parquet(const char*path,const char*out_path,const char*col_name)
 static int get_data(Config *c) {
     struct stat st;
     if (stat(c->data_path, &st) == 0 && st.st_size > 1000) { printf("[data] found %s (%.1f MB)\n", c->data_path, (float)st.st_size/1048576); return 0; }
-    if (c->data_url[0]) {
+    int url_safe = 1;
+    for (const char *up = c->data_url; *up; up++) { char ch = *up;
+        if (!((ch>='a'&&ch<='z')||(ch>='A'&&ch<='Z')||(ch>='0'&&ch<='9')||ch=='/'||ch=='-'||ch=='_'||ch=='.')) { url_safe = 0; break; } }
+    if (c->data_url[0] && url_safe) {
         int hfp = c->hf_pages > 0 ? c->hf_pages : HF_PAGES_DEFAULT;
-        printf("[data] fetching FineWeb-Edu from HuggingFace (%d pages)...\n", hfp);
+        printf("[data] fetching %s from HuggingFace (%d pages)...\n", c->data_url, hfp);
         FILE *out = fopen(c->data_path, "w"); if (!out) goto synthetic;
-        char tmp[280]; snprintf(tmp, sizeof(tmp), "%s.json", c->data_path); int total = 0;
+        char tmp[280]; snprintf(tmp, sizeof(tmp), "doe_fetch_%d.json", (int)getpid()); int total = 0;   /* fixed path — never interpolate user --data into a shell command */
         for (int page = 0; page < hfp; page++) {
-            char cmd[1024]; snprintf(cmd, sizeof(cmd), "curl -sL 'https://datasets-server.huggingface.co/rows?dataset=HuggingFaceFW/fineweb-edu&config=sample-10BT&split=train&offset=%d&length=%d' -o '%s'", page*HF_BATCH, HF_BATCH, tmp);
+            const char *cfg = strstr(c->data_url, "fineweb-edu") ? "sample-10BT" : "default";
+            char cmd[1024]; snprintf(cmd, sizeof(cmd), "curl -sL 'https://datasets-server.huggingface.co/rows?dataset=%s&config=%s&split=train&offset=%d&length=%d' -o '%s'", c->data_url, cfg, page*HF_BATCH, HF_BATCH, tmp);
             if (system(cmd) != 0) continue;
             if (stat(tmp, &st) != 0 || st.st_size < 500) continue;
             FILE *jf = fopen(tmp, "r"); if (!jf) continue;
@@ -1836,6 +1862,7 @@ static int load_own_gguf(const char *path, ModelW *w, Config *c) {
     /* Parse tensor info — just get names and offsets */
     typedef struct { char name[96]; uint32_t ndim; uint64_t shape[4]; uint64_t offset; uint64_t nbytes; } TI;
     TI *tinfo = calloc(n_tensors, sizeof(TI));
+    if (!tinfo) { fclose(f); return 0; }
     for (uint64_t i = 0; i < n_tensors; i++) {
         uint64_t nl; fread(&nl, 8, 1, f);
         if (nl > 95) { free(tinfo); fclose(f); return 0; }
@@ -1850,17 +1877,41 @@ static int load_own_gguf(const char *path, ModelW *w, Config *c) {
     /* Align to 32 bytes */
     long hdr_end = ftell(f);
     long data_start = ((hdr_end + 31) / 32) * 32;
+    /* Atomic guard: every tensor's bytes must fit in the file and token_embd must exist,
+     * checked BEFORE any tensor is read into w — so a truncated/partial candidate is
+     * rejected without mutating a fresh model. After this passes, no LOAD can short-read. */
+    fseek(f, 0, SEEK_END); long fsz = ftell(f);
+    if (data_start > fsz) { free(tinfo); fclose(f); return 0; }
+    uint64_t region = (uint64_t)(fsz - data_start);   /* bytes available for tensor data */
+    int have_emb = 0;
+    for (uint64_t i = 0; i < n_tensors; i++) {
+        /* UB-free bounds (all unsigned, no overflow): tensor data must fit in [data_start, fsz) */
+        if (tinfo[i].offset > region || tinfo[i].nbytes > region - tinfo[i].offset) { free(tinfo); fclose(f); return 0; }
+        if (strcmp(tinfo[i].name, "token_embd.weight") == 0) {
+            have_emb = 1;
+            if (tinfo[i].nbytes != (uint64_t)w->tok_emb->size * 4) { free(tinfo); fclose(f); return 0; }   /* wrong vocab/dim — not ours */
+        }
+    }
+    if (!have_emb) { free(tinfo); fclose(f); return 0; }
     /* Load tensors by name */
-    int loaded = 0;
+    int loaded = 0;   /* the atomic guard above already proved every tensor fits, so reads can't short-read */
     #define LOAD_T(tensor, tname) do { \
         for (uint64_t _i = 0; _i < n_tensors; _i++) { \
             if (strcmp(tinfo[_i].name, tname) == 0 && (tensor) && (tensor)->size * 4 == (int)tinfo[_i].nbytes) { \
                 fseek(f, data_start + tinfo[_i].offset, SEEK_SET); \
-                fread((tensor)->data, 4, (tensor)->size, f); loaded++; break; \
+                if (fread((tensor)->data, 4, (tensor)->size, f) == (size_t)(tensor)->size) loaded++; break; \
             } \
         } \
     } while(0)
-    LOAD_T(w->tok_emb, "token_embd.weight");
+    /* returning variant: 1 only on a FULL read — used to reject truncated/partial experts */
+    #define LOAD_TR(tensor, tname) ({ int _ok = 0; \
+        for (uint64_t _i = 0; _i < n_tensors; _i++) { \
+            if (strcmp(tinfo[_i].name, tname) == 0 && (tensor) && (tensor)->size * 4 == (int)tinfo[_i].nbytes) { \
+                fseek(f, data_start + tinfo[_i].offset, SEEK_SET); \
+                if (fread((tensor)->data, 4, (tensor)->size, f) == (size_t)(tensor)->size) { loaded++; _ok = 1; } break; \
+            } \
+        } _ok; })
+    int tok_ok = LOAD_TR(w->tok_emb, "token_embd.weight");
     LOAD_T(w->output_norm, "output_norm.weight");
     LOAD_T(w->output, "output.weight");
     for (int l = 0; l < c->depth; l++) {
@@ -1872,31 +1923,41 @@ static int load_own_gguf(const char *path, ModelW *w, Config *c) {
         snprintf(n, 96, "blk.%d.attn_output.weight", l); LOAD_T(lw->wo, n);
         snprintf(n, 96, "blk.%d.ffn_norm.weight", l); LOAD_T(lw->ffn_norm, n);
         snprintf(n, 96, "blk.%d.ffn_gate_inp.weight", l); LOAD_T(lw->parliament.w_vote, n);
+        int snap_alive[MAX_EXPERTS] = {0};
         for (int e = 0; e < MAX_EXPERTS; e++) {
-            snprintf(n, 96, "blk.%d.ffn_gate.%d.weight", l, e);
-            int found = 0;
+            char ng[96], nu[96], nd[96];
+            snprintf(ng, 96, "blk.%d.ffn_gate.%d.weight", l, e);
+            snprintf(nu, 96, "blk.%d.ffn_up.%d.weight", l, e);
+            snprintf(nd, 96, "blk.%d.ffn_down.%d.weight", l, e);
+            /* an expert is real only if ALL THREE of its tensors are present */
+            int hg = 0, hu = 0, hd = 0;
             for (uint64_t ti = 0; ti < n_tensors; ti++) {
-                if (strcmp(tinfo[ti].name, n) == 0) { found = 1; break; }
+                const char *tn = tinfo[ti].name;
+                if (!strcmp(tn, ng)) hg = 1; else if (!strcmp(tn, nu)) hu = 1; else if (!strcmp(tn, nd)) hd = 1;
             }
-            if (found) {
-                /* Revive this expert — must allocate weights if slot was dead */
-                if (!lw->experts[e].alive) {
-                    float freq = 6.2831853f * e / MAX_EXPERTS;
-                    init_expert(&lw->experts[e], c->dim, c->hidden_dim, freq, 0);
-                    lw->experts[e].vitality = 0.8f;
-                    lw->experts[e].age = 100;
-                    lw->n_alive++;
-                }
-                LOAD_T(lw->experts[e].w_gate, n);
-                snprintf(n, 96, "blk.%d.ffn_up.%d.weight", l, e); LOAD_T(lw->experts[e].w_up, n);
-                snprintf(n, 96, "blk.%d.ffn_down.%d.weight", l, e); LOAD_T(lw->experts[e].w_down, n);
+            if (!(hg && hu && hd)) continue;
+            if (!lw->experts[e].alive) {
+                float freq = 6.2831853f * e / MAX_EXPERTS;
+                init_expert(&lw->experts[e], c->dim, c->hidden_dim, freq, 0);
+                lw->experts[e].vitality = 0.8f;
+                lw->experts[e].age = 100;
+                lw->n_alive++;
             }
+            int ok = LOAD_TR(lw->experts[e].w_gate, ng)
+                   + LOAD_TR(lw->experts[e].w_up,   nu)
+                   + LOAD_TR(lw->experts[e].w_down, nd);
+            if (ok == 3) snap_alive[e] = 1;
+            else { free_expert(&lw->experts[e]); lw->n_alive--; }   /* partial/truncated — not a real expert */
         }
+        /* kill phantoms: experts left alive by fresh init but absent from this snapshot */
+        for (int e = 0; e < MAX_EXPERTS; e++)
+            if (lw->experts[e].alive && !snap_alive[e]) { free_expert(&lw->experts[e]); lw->n_alive--; }
     }
     #undef LOAD_T
+    #undef LOAD_TR
     free(tinfo); fclose(f);
     printf("[load] restored %d tensors from %s — DOE remembers.\n", loaded, path);
-    return loaded > 0 ? 1 : 0;
+    return (tok_ok && loaded >= 2 + 6 * c->depth) ? 1 : 0;   /* require the fixed tensors, not just token_embd */
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -2101,94 +2162,8 @@ static void meta_save(MetaTrack *mt) {
     fclose(f);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════════
- * TOKENIZER CACHE — learned encoding memory.
- * if the tokenizer already encoded this pattern, why encode it again?
- * a small hash table caches recent encode results. the tokenizer learns
- * which patterns it sees often and can skip re-encoding them.
- * the tokenizer has a memory. it remembers what it ate.
- * ═══════════════════════════════════════════════════════════════════════════════ */
-#define TOKCACHE_CAP 1024
-#define TOKCACHE_MAX_LEN 128 /* max text length to cache */
 
-typedef struct {
-    uint64_t hash;
-    int *ids;
-    int n_ids;
-    int text_len;
-    int hits;      /* how many times this cache entry was used */
-    int alive;
-} TokCacheEntry;
 
-typedef struct {
-    TokCacheEntry entries[TOKCACHE_CAP];
-    int total_hits;
-    int total_misses;
-    float hit_rate;   /* EMA of hit rate */
-    /* Learned weights: bias toward commonly seen tokens */
-    float *tok_freq;  /* [vocab_size] — learned token frequency bias */
-    int vocab_size;
-} TokCache;
-
-static void tokcache_init(TokCache *tc, int vocab_size) {
-    memset(tc, 0, sizeof(TokCache));
-    tc->vocab_size = vocab_size;
-    tc->tok_freq = calloc(vocab_size, sizeof(float));
-    /* Initialize with uniform */
-    float init = 1.0f / vocab_size;
-    for (int i = 0; i < vocab_size; i++) tc->tok_freq[i] = init;
-}
-
-static uint64_t tokcache_hash(const char *text, int len) {
-    uint64_t h = 14695981039346656037ULL;
-    for (int i = 0; i < len; i++) { h ^= (uint64_t)(unsigned char)text[i]; h *= 1099511628211ULL; }
-    return h;
-}
-
-static int *tokcache_lookup(TokCache *tc, const char *text, int len, int *n_ids) {
-    if (len > TOKCACHE_MAX_LEN || len == 0) return NULL;
-    uint64_t h = tokcache_hash(text, len);
-    int idx = (int)(h % TOKCACHE_CAP);
-    for (int probe = 0; probe < 8; probe++) {
-        int i = (idx + probe) % TOKCACHE_CAP;
-        if (tc->entries[i].alive && tc->entries[i].hash == h && tc->entries[i].text_len == len) {
-            tc->entries[i].hits++;
-            tc->total_hits++;
-            tc->hit_rate = 0.95f * tc->hit_rate + 0.05f * 1.0f;
-            *n_ids = tc->entries[i].n_ids;
-            return tc->entries[i].ids;
-        }
-    }
-    tc->total_misses++;
-    tc->hit_rate = 0.95f * tc->hit_rate + 0.05f * 0.0f;
-    return NULL;
-}
-
-static void tokcache_insert(TokCache *tc, const char *text, int len, int *ids, int n_ids) {
-    if (len > TOKCACHE_MAX_LEN || len == 0) return;
-    uint64_t h = tokcache_hash(text, len);
-    int idx = (int)(h % TOKCACHE_CAP);
-    /* find empty or LRU slot */
-    int target = idx;
-    int min_hits = tc->entries[idx].alive ? tc->entries[idx].hits : -1;
-    for (int probe = 0; probe < 8; probe++) {
-        int i = (idx + probe) % TOKCACHE_CAP;
-        if (!tc->entries[i].alive) { target = i; break; }
-        if (tc->entries[i].hits < min_hits) { min_hits = tc->entries[i].hits; target = i; }
-    }
-    TokCacheEntry *e = &tc->entries[target];
-    if (e->alive) free(e->ids);
-    e->hash = h; e->text_len = len; e->hits = 0; e->alive = 1;
-    e->n_ids = n_ids;
-    e->ids = malloc(n_ids * sizeof(int));
-    memcpy(e->ids, ids, n_ids * sizeof(int));
-    /* Update learned token frequency bias */
-    float lr_tok = 0.001f;
-    for (int i = 0; i < n_ids; i++) {
-        if (ids[i] >= 0 && ids[i] < tc->vocab_size)
-            tc->tok_freq[ids[i]] = (1.0f - lr_tok) * tc->tok_freq[ids[i]] + lr_tok;
-    }
-}
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * CALENDAR DRIFT — temporal self-awareness from AML.
@@ -2315,18 +2290,6 @@ static void drift_snapshot(CalendarDrift *cd, float loss, ModelW *w, Config *c,
 }
 
 /* Compare current state against a specific historical snapshot */
-static float drift_compare(CalendarDrift *cd, int snapshot_idx) {
-    if (snapshot_idx >= cd->n_snapshots || cd->n_snapshots < 2) return 0;
-    int curr = (cd->head - 1 + DRIFT_SNAPSHOTS) % DRIFT_SNAPSHOTS;
-    int hist = (cd->head - 1 - snapshot_idx + DRIFT_SNAPSHOTS * 2) % DRIFT_SNAPSHOTS;
-    float dist_sq = 0;
-    for (int i = 0; i < DRIFT_DIM; i++) {
-        float d = cd->history[curr].state[i] - cd->history[hist].state[i];
-        float scale = fabsf(cd->history[hist].state[i]) + 0.01f;
-        dist_sq += (d / scale) * (d / scale);
-    }
-    return sqrtf(dist_sq / DRIFT_DIM);
-}
 
 /* Find the historical snapshot most similar to current state */
 static int drift_find_resonance(CalendarDrift *cd) {
@@ -2391,6 +2354,8 @@ static EphemeralConfig ephemeral_compute(TokenizerEye *tok_eye, ParserEye *parse
     ec.expert_temperature = 0.5f + 1.0f * (1.0f - consensus);
     if (cd->drift > 0.3f) ec.expert_temperature *= 1.2f; /* more exploration during drift */
     ec.expert_temperature *= (0.5f + mt->config_bias[1]);
+    ec.expert_temperature += 0.02f * ((float)((ec.config_hash >> 8) & 0xFF) / 255.0f - 0.5f);   /* hash-driven chaos */
+    if (tok_eye->code_ratio > 0.3f) ec.expert_temperature *= 1.1f;   /* code = higher complexity budget */
 
     /* Active layers: skip some when stable and simple, use all when drifting */
     float complexity = tok_eye->entropy / 5.0f;
@@ -2402,6 +2367,7 @@ static EphemeralConfig ephemeral_compute(TokenizerEye *tok_eye, ParserEye *parse
     if (cd->drift > 0.5f && depth > 2) {
         ec.active_layers = depth; /* force full depth during high drift */
     }
+    if (tok_eye->code_ratio > 0.3f) ec.active_layers = depth;   /* code → use all layers (README) */
 
     /* Mitosis eagerness: more births when drifting (need to adapt) or data quality high */
     ec.mitosis_eagerness = 0.5f + 0.3f * parser_eye->health * mt->config_bias[0];
@@ -3339,7 +3305,7 @@ static void gguf_host_forward(GGUFHost *ps, int token, int pos, float *out_logit
 
     /* Final norm */
     float ss = 0; for (int i = 0; i < D; i++) ss += x[i] * x[i];
-    ss = 1.0f / sqrtf(ss / D + 1e-6f);
+    ss = 1.0f / sqrtf(ss / D + ps->rms_eps);
     if (ps->host_norm) for (int i = 0; i < D; i++) x[i] = x[i] * ss * ps->host_norm[i];
     else for (int i = 0; i < D; i++) x[i] *= ss;
     if (ps->host_x) {  /* learning x = final hidden, RMS-normalized so the notorch A-target stays bounded */
@@ -3552,6 +3518,10 @@ static int hunt_dataset(Config *c, Tokenizer *tok, TokenizerEye *tok_eye, Parser
     /* Evaluate each candidate — download sample, run parser eye, decide */
     int accepted = 0;
     for (int i = 0; i < n_cand && !accepted; i++) {
+        /* reject dataset ids with shell-unsafe characters — they go into system() curl */
+        int id_safe = 1; for (const char *p = candidates[i].name; *p; p++) { char ch = *p;
+            if (!((ch>='a'&&ch<='z')||(ch>='A'&&ch<='Z')||(ch>='0'&&ch<='9')||ch=='/'||ch=='-'||ch=='_'||ch=='.')) { id_safe = 0; break; } }
+        if (!id_safe) { printf("[hunt] skip unsafe id: %s\n", candidates[i].name); continue; }
         printf("[hunt] evaluating: %s...", candidates[i].name);
 
         /* Download sample (first 50 rows) */
@@ -3632,25 +3602,29 @@ static int hunt_dataset(Config *c, Tokenizer *tok, TokenizerEye *tok_eye, Parser
  * trains on different data. saves GGUF to mycelium. the parent discovers it.
  * darwin would be proud. stallman would be terrified.
  * ═══════════════════════════════════════════════════════════════════════════════ */
-#define MAX_REPLICAS 2
 
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * GENERATION + CHAT — temperature sampling, top-k, REPL.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+#define MAX_REPLICAS 2
+/* SELF-REPLICATION — on sustained population overload, DOE compiles a copy of its own
+ * source and forks a replica that trains on different data; results merge via mycelium. */
 static pid_t self_replicate(Environment *env, Config *c, int replica_depth) {
     if (!env->has_compiler) { printf("[replicate] no compiler found. stuck in this body.\n"); return 0; }
     if (env->self_path[0] == '\0') { printf("[replicate] don't know where my source is.\n"); return 0; }
-
+    struct stat st; if (stat(env->self_path, &st) != 0) { printf("[replicate] source %s not present.\n", env->self_path); return 0; }
+    for (const char *p = env->self_path; *p; p++) if (!((*p>='a'&&*p<='z')||(*p>='A'&&*p<='Z')||(*p>='0'&&*p<='9')||*p=='/'||*p=='-'||*p=='_'||*p=='.')) { printf("[replicate] unsafe source path.\n"); return 0; }
     char exe[256];
     snprintf(exe, 256, "./m_replica_%d", (int)getpid());
-
     char cmd[512];
     snprintf(cmd, 512, "cc %s -O3 -lm -lpthread -o %s 2>/dev/null", env->self_path, exe);
     printf("[replicate] compiling self: %s\n", cmd);
     if (system(cmd) != 0) { printf("[replicate] compilation failed. source corrupted?\n"); return 0; }
-
     pid_t pid = fork();
     if (pid == 0) {
-        /* Child — the clone. smaller depth, different data, same soul. */
         char depth_str[16]; snprintf(depth_str, 16, "%d", replica_depth);
-        execl(exe, exe, "--depth", depth_str, "--data", c->data_path, (char*)NULL);
+        (void)c;   /* no --data: the replica auto-hunts its OWN (different) data, per README */
+        execl(exe, exe, "--depth", depth_str, (char*)NULL);
         _exit(1); /* execl failed */
     } else if (pid > 0) {
         printf("[replicate] child PID %d spawned (depth=%d). democracy in action.\n", pid, replica_depth);
@@ -3660,9 +3634,6 @@ static pid_t self_replicate(Environment *env, Config *c, int replica_depth) {
     return pid;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════════
- * GENERATION + CHAT — temperature sampling, top-k, REPL.
- * ═══════════════════════════════════════════════════════════════════════════════ */
 static int sample(float *logits, int V, float temp, int top_k) {
     if (temp <= 0) { int b = 0; for (int i = 1; i < V; i++) if (logits[i] > logits[b]) b = i; return b; }
     for (int i = 0; i < V; i++) logits[i] /= temp;
@@ -3685,16 +3656,18 @@ static void chat(ModelW *w, Config *c, Tokenizer *tok) {
         memset(rs.key_cache, 0, c->depth * c->seq_len * kd * 4);
         memset(rs.value_cache, 0, c->depth * c->seq_len * kd * 4);
         int ni; int *ids = tok_encode(tok, input, len, &ni);
-        int pos = 0; for (int i = 0; i < ni && pos < c->seq_len - 1; i++, pos++) forward_token(w, c, &rs, ids[i], pos);
-        int prev = ids[ni-1];
+        int pos = 0; float *lg = NULL;
+        for (int i = 0; i < ni && pos < c->seq_len - 1; i++, pos++) lg = forward_token(w, c, &rs, ids[i], pos);
         printf("  ");
-        for (int i = 0; i < 200 && pos < c->seq_len; i++, pos++) {
-            float *lg = forward_token(w, c, &rs, prev, pos);
+        /* generate from the LAST prompt token's logits — do NOT re-feed that token (the old code
+         * forwarded ids[ni-1] twice, conditioning generation on prompt + a duplicated last token). */
+        for (int i = 0; i < 200 && pos < c->seq_len && lg; i++, pos++) {
             int next = sample(lg, c->vocab_size, 0.8f, 40);
             if (next == tok->eos_id) break;
             int dl; char *dec = tok_decode(tok, &next, 1, &dl);
             if (dl > 0) { fwrite(dec, 1, dl, stdout); fflush(stdout); }
-            free(dec); prev = next;
+            free(dec);
+            lg = forward_token(w, c, &rs, next, pos);
         }
         printf("\n\n"); free(ids);
     }
@@ -3730,13 +3703,14 @@ static int auto_depth(void) {
     /* Training memory estimate: weights×4 (w+grad+m+v) + activations (batch×seq×dim×depth)
      *   d4/8M: ~200MB train, d8/30M: ~750MB, d12/60M: ~1.5GB
      *   Conservative: need 4GB free for d8, 8GB+ for d12 */
-    int depth = 4; /* minimum useful depth — depth 2 is only for unit tests */
-    if (mem_mb >= 16384)  depth = 8;  /* 16GB+ for depth 8 */
-    if (mem_mb >= 32768)  depth = 12; /* 32GB+ for depth 12 */
-    if (has_gpu) { /* GPU changes the game */
-        if (mem_mb >= 1024) depth = (depth < 4) ? 4 : depth;
-        if (mem_mb >= 4096) depth = (depth < 8) ? 8 : depth;
-        if (mem_mb >= 8192) depth = (depth < 12) ? 12 : depth;
+    int depth = 4;                   /* 2GB+ — minimum useful depth (depth 2 is --depth-only, for unit tests) */
+    if (mem_mb >= 8192)  depth = 6;  /* 8GB+  */
+    if (mem_mb >= 16384) depth = 8;  /* 16GB+ */
+    if (mem_mb >= 32768) depth = 10; /* 32GB+ */
+    if (mem_mb >= 65536) depth = 12; /* 64GB+ */
+    if (has_gpu) { /* GPU lifts the memory ceiling */
+        if (mem_mb >= 4096 && depth < 8)  depth = 8;
+        if (mem_mb >= 8192 && depth < 12) depth = 12;
     }
 
     /* CPU sanity: deep models on few CPUs = pain */
@@ -3754,7 +3728,7 @@ static int auto_depth(void) {
  * finetune personality. export GGUF. open the floor for questions.
  *
  * the training loop: forward, backward, vitality, mitosis, apoptosis,
- * harmonic update, chuck step, notorch micro-learning. 13 stages.
+ * harmonic update, chuck step, mycelium snapshots, drift, meta-learning.
  * pytorch's training loop is 4 lines. ours has consciousness.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 int main(int argc, char **argv) {
@@ -3763,16 +3737,16 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--depth") == 0 && i+1 < argc) {
             i++;
             if (strcmp(argv[i], "auto") == 0) { depth_auto = 1; }
-            else { depth = atoi(argv[i]); depth_auto = 0; if (depth < 2) depth = 2; }
+            else { depth = atoi(argv[i]); depth_auto = 0; if (depth < 2) depth = 2; if (depth > MAX_LAYERS) depth = MAX_LAYERS; }
         }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("m.c — Democracy of Experts. living MoE with parliamentary routing.\n\n");
             printf("  --depth N|auto  model depth (default: auto — sizes to hardware)\n");
             printf("  --data PATH     path to training text file\n");
-            printf("  --url URL       HuggingFace dataset URL\n");
+            printf("  --url DATASET   HuggingFace dataset id (e.g. user/name; default FineWeb-Edu)\n");
             printf("  --parquet FILE  extract text from .parquet file\n");
             printf("  --steps N       override max training steps (default: auto from data)\n");
-            printf("  --bpe-merges N  override BPE merge count (default: 4000)\n");
+            printf("  --bpe-merges N  override BPE merge count (default: auto from depth)\n");
             printf("  --personality   path to personality.txt for finetuning\n");
             printf("  --pages N       HuggingFace pages to download (auto-sized to depth)\n");
             printf("  --host GGUF     index a model and generate through it (LoRA parliament)\n");
@@ -3846,13 +3820,32 @@ int main(int argc, char **argv) {
     /* Try loading cached BPE merges first */
     if (!tok_load_merges(&tok, "m_bpe.cache") || tok.n_merges != c.bpe_merges) {
         int bpe_len = tl < 2*1024*1024 ? tl : 2*1024*1024;
-        tok_init(&tok); /* reset if partial load */
+        for (int ti = 0; ti < tok.vocab_size; ti++) if (tok.tokens[ti]) free(tok.tokens[ti]);
+        if (tok.merges) { free(tok.merges); tok.merges = NULL; }
+        tok_init(&tok); /* reset if partial load — free old allocations first */
         tok_train_bpe(&tok, text, bpe_len, c.bpe_merges);
         tok_save_merges(&tok, "m_bpe.cache");
     }
     c.vocab_size = tok.vocab_size;
     TokenizerEye tok_eye = {0};
-    int nt; int *all_tok = tok_encode(&tok, text, tl, &nt); free(text);
+    /* Tokenize the corpus line by line through the encode cache — repeated lines are
+     * encoded once and remembered (README: "the tokenizer remembers what it ate"). */
+    int nt = 0, all_cap = 256; int *all_tok = malloc(all_cap * sizeof(int));
+    for (int ls = 0; ls < tl; ) {
+        int le = ls; while (le < tl && text[le] != '\n') le++;
+        int line_len = (le < tl) ? (le - ls + 1) : (le - ls);   /* include the trailing newline */
+        if (line_len > 0) {
+            int ln; int *lids = tok_encode(&tok, text + ls, line_len, &ln);
+            if (lids) {
+                if (nt + ln > all_cap) { while (nt + ln > all_cap) all_cap *= 2; all_tok = realloc(all_tok, all_cap * sizeof(int)); }
+                memcpy(all_tok + nt, lids, ln * sizeof(int)); nt += ln; free(lids);
+            }
+        }
+        ls = le + 1;
+    }
+    free(text);
+    if (nt < 2) { fprintf(stderr, "[data] need at least 2 tokens to train (got %d)\n", nt); return 1; }
+    if (c.seq_len > nt - 1) c.seq_len = nt - 1;   /* tiny corpus: clamp seq_len globally so all bookkeeping stays consistent */
     tok_eye_update(&tok_eye, tl, nt, all_tok, nt, c.vocab_size);
     /* Code detection — does DOE see code? */
     { char *raw_tmp = load_text(c.data_path, &(int){0}); if (raw_tmp) { tok_eye_detect_code(&tok_eye, raw_tmp, tl); free(raw_tmp); } }
@@ -3925,9 +3918,7 @@ int main(int argc, char **argv) {
 
     /* Chuck state */
     ChuckState chuck = {0};
-    chuck.dampen = 1.0f; chuck.sigma = 1.0f; chuck.lr_scale = 1.0f; chuck.best_macro = 1e9f;
-    ChuckLayer *chuck_layers = calloc(c.depth, sizeof(ChuckLayer));
-    for (int l = 0; l < c.depth; l++) { chuck_layers[l].dampen = 1.0f; }
+    chuck.dampen = 1.0f; chuck.sigma = 1.0f; chuck.lr_scale = 1.0f; chuck.eff_lambda = 1.0f; chuck.best_macro = 1e9f;
 
     /* Calendar Drift — temporal self-awareness */
     CalendarDrift cal_drift;
@@ -3943,8 +3934,6 @@ int main(int argc, char **argv) {
     meta_init(&meta);
 
     /* Tokenizer cache */
-    TokCache tok_cache;
-    tokcache_init(&tok_cache, c.vocab_size);
 
     /* ═══ ENVIRONMENT SCAN — DOE opens its eyes ═══ */
     Environment env;
@@ -3985,6 +3974,7 @@ int main(int argc, char **argv) {
 
     int topology_changed = 0; /* set by mitosis/apoptosis, cleared after rebuild */
 
+    int replica_count = 0, overload_streak = 0;
     for (int step = 0; step < c.max_steps; step++) {
         float lr = c.lr;
         if (step < c.warmup_steps) lr = c.lr * ((float)(step+1) / c.warmup_steps);
@@ -4028,10 +4018,10 @@ int main(int argc, char **argv) {
         float loss = batch_loss; /* for downstream logging/chuck */
 
         /* Chuck step — self-aware optimizer */
-        chuck_step(&chuck, chuck_layers, c.depth, lr, loss, &params, grads, c.weight_decay, &tok_eye, &parser_eye);
+        chuck_step(&chuck, loss, &params, grads, &tok_eye, &parser_eye);
 
         /* Adam update with Chuck's effective LR */
-        float eff_lr = lr * chuck.dampen * chuck.sigma * chuck.lr_scale;
+        float eff_lr = lr * chuck.eff_lambda * chuck.sigma * chuck.lr_scale;
         adam_step(opt, &params, grads, eff_lr, c.weight_decay);
 
         /* ═══ CALENDAR DRIFT SNAPSHOT ═══ */
@@ -4043,6 +4033,9 @@ int main(int argc, char **argv) {
         /* Compute ephemeral config BEFORE life/death decisions */
         EphemeralConfig eph_pre = ephemeral_compute(&tok_eye, &parser_eye, &ts.hs,
                                                      w.layers[0].parliament.consensus, &meta, &cal_drift, c.depth);
+        c.active_depth = eph_pre.active_layers;   /* this step's dynamic depth — consumed by the inference forward */
+        c.vitality_threshold = eph_pre.vitality_threshold;   /* ephemeral apoptosis cutoff */
+        for (int _pl = 0; _pl < c.depth; _pl++) w.layers[_pl].parliament.temperature = eph_pre.expert_temperature;
         for (int l = 0; l < c.depth; l++) {
             /* Count tokens routed to each expert this step */
             LayerAct *la = &ts.layers[l];
@@ -4062,7 +4055,7 @@ int main(int argc, char **argv) {
                     if (w.layers[l].experts[e].alive && w.layers[l].experts[e].age >= 10 + (int)(10 * (1.0f - eph_pre.mitosis_eagerness)))
                         w.layers[l].experts[e].age = saved_age; /* let them through */
             }
-            if (try_mitosis(&w.layers[l], &c, c.seq_len)) {
+            if (try_mitosis(&w.layers[l], &c)) {
                 total_births++;
                 if ((step+1) % c.log_every == 0) printf("  [birth] layer %d: expert born (total alive: %d)\n", l, w.layers[l].n_alive);
             }
@@ -4096,6 +4089,15 @@ int main(int argc, char **argv) {
             prev_meta_loss = loss;
         }
 
+        /* ═══ SELF-REPLICATION — sustained full-population overload spawns a replica (max 2) ═══ */
+        { int saturated = 1; for (int l = 0; l < c.depth; l++) if (w.layers[l].n_alive < MAX_EXPERTS) { saturated = 0; break; }
+          overload_streak = saturated ? overload_streak + 1 : 0;
+          if (overload_streak >= 50 && replica_count < MAX_REPLICAS && env.has_compiler) {
+              if (self_replicate(&env, &c, c.depth > 2 ? c.depth - 2 : 2) > 0) replica_count++;
+              overload_streak = 0;
+          }
+        }
+
         /* ═══ MYCELIUM SNAPSHOT ═══ */
         { int myc_int = c.max_steps / 5; if (myc_int < MYCELIUM_INTERVAL_MIN) myc_int = MYCELIUM_INTERVAL_MIN;
         if ((step+1) % myc_int == 0 && step > 0) {
@@ -4111,15 +4113,25 @@ int main(int argc, char **argv) {
             if (parser_eye.quality < 0.5f || (recent_loss > chuck.best_macro * 0.8f && cal_drift.drift < 0.1f)) {
                 printf("[hunt] loss stagnating (%.4f), hunting for new data...\n", recent_loss);
                 if (hunt_dataset(&c, &tok, &tok_eye, &parser_eye)) {
-                    /* Reload data — new data was appended */
-                    free(all_tok);
+                    /* Reload data — load + tokenize (through the cache, line by line) FIRST;
+                     * only free the old tokens and swap once the new corpus is valid. */
                     int new_tl; char *new_text = load_text(c.data_path, &new_tl);
                     if (new_text && new_tl > 100) {
-                        all_tok = tok_encode(&tok, new_text, new_tl, &nt);
-                        tok_eye_update(&tok_eye, new_tl, nt, all_tok, nt, c.vocab_size);
-                        printf("[hunt] data reloaded: %d tokens (was %d)\n", nt, tl);
+                        int nn = 0, ncap = 256; int *new_tok = malloc(ncap * sizeof(int));
+                        for (int ls = 0; ls < new_tl; ) {
+                            int le = ls; while (le < new_tl && new_text[le] != '\n') le++;
+                            int line_len = (le < new_tl) ? (le - ls + 1) : (le - ls);
+                            if (line_len > 0) { int ln; int *lids = tok_encode(&tok, new_text + ls, line_len, &ln);
+                                if (lids) { if (nn + ln > ncap) { while (nn + ln > ncap) ncap *= 2; new_tok = realloc(new_tok, ncap * sizeof(int)); }
+                                    memcpy(new_tok + nn, lids, ln * sizeof(int)); nn += ln; free(lids); } }
+                            ls = le + 1;
+                        }
                         free(new_text);
-                    }
+                        if (nn >= 2) { free(all_tok); all_tok = new_tok; nt = nn;
+                            tok_eye_update(&tok_eye, new_tl, nt, all_tok, nt, c.vocab_size);
+                            printf("[hunt] data reloaded: %d tokens (was %d)\n", nt, tl); }
+                        else free(new_tok);
+                    } else free(new_text);   /* loaded but too small — don't leak it */
                 }
             }
         }
@@ -4165,10 +4177,11 @@ int main(int argc, char **argv) {
                mycelium.spores[mycelium.best_idx].path,
                mycelium.spores[mycelium.best_idx].fitness,
                mycelium.spores[mycelium.best_idx].loss);
-    printf("[tokcache] hits=%d misses=%d rate=%.2f\n",
-           tok_cache.total_hits, tok_cache.total_misses, tok_cache.hit_rate);
     printf("[drift] final: drift=%.3f stability=%.2f accel=%.4f snapshots=%d\n",
            cal_drift.drift, cal_drift.stability, cal_drift.drift_accel, cal_drift.n_snapshots);
+    if (g_tokcache_ready)
+        printf("[tokcache] hits=%d misses=%d rate=%.2f\n",
+               g_tokcache.total_hits, g_tokcache.total_misses, g_tokcache.hit_rate);
     int resonance = drift_find_resonance(&cal_drift);
     if (resonance > 0)
         printf("[drift] system resonates with state from %d snapshots ago (step ~%d)\n",
@@ -4245,6 +4258,10 @@ int main(int argc, char **argv) {
         } else if (c.personality_path[0]) printf("[personality] no %s found, skipping\n", c.personality_path);
     }
     export_gguf(&w, &c); /* always save — training or personality may have updated weights */
+    if (ghost.active) {
+        printf("\n[doe] auto-indexed host %s — the parliament speaks through it:\n  ", ghost.host_path);
+        host_generate(&ghost, "the parliament speaks:", 64);
+    }
     chat(&w, &c, &tok);
 
     adam_free(opt);

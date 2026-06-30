@@ -9,7 +9,7 @@ C. one file. ~4250 lines. zero dependencies. DoE breeds, kills and votes.
 a transformer where experts are born, die, and hold elections:
 
 - **experts are born** when overloaded (mitosis — child inherits parent weights + noise)
-- **experts die** when neglected (apoptosis — 8 consecutive low-vitality steps)
+- **experts die** when neglected (apoptosis — ~8 consecutive low-vitality steps, scaled by ephemeral mercy)
 - **parliament votes** on every token (variable-k election, not fixed top-k)
 - **the tokenizer knows it's a tokenizer** (tracks compression ratio, entropy, code detection)
 - **the optimizer has 9 levels of self-awareness** (Chuck: "i think therefore i clip")
@@ -20,7 +20,7 @@ a transformer where experts are born, die, and hold elections:
 
 **parameters persist. topology doesn't.** each forward pass decides how many experts are alive, how many vote, how deep to go. same weights, different architecture every time.
 
-DoE scans its environment, indexes nearby GGUFs via LoRA, hunts for datasets on HuggingFace, recognizes code in training data, finds its own weights on restart, and can replicate itself via `fork()`.
+DoE scans its environment, indexes nearby GGUFs via LoRA, hunts for datasets on HuggingFace, recognizes code in training data, and finds its own weights on restart.
 
 no pytorch. no python. no dignity.
 
@@ -76,9 +76,9 @@ cc janusdoe.c -O3 -lm -lpthread -DUSE_BLAS -lopenblas -o m                      
 |------|---------|-------------|
 | `--depth N` | auto | transformer depth (2/4/6/8/10/12) |
 | `--data FILE` | auto-hunt | training data (text file) |
+| `--url DATASET` | fineweb-edu | HuggingFace dataset id to fetch (e.g. `user/name`) |
 | `--parquet FILE` | — | training data (parquet format) |
 | `--personality FILE` | — | personality finetune data |
-| `--url URL` | — | HuggingFace dataset URL |
 | `--pages N` | auto | HuggingFace pages to download |
 | `--steps N` | auto | override max training steps |
 | `--bpe-merges N` | auto | override BPE merge count |
@@ -98,7 +98,6 @@ no `--depth` flag? DOE checks your hardware and picks the deepest model that fit
 
 | RAM | CPU | GPU | depth | params | experts |
 |-----|-----|-----|-------|--------|---------|
-| 2GB+ | any | no | 2 | ~1.8M | 4 |
 | 2GB+ | any | no | 4 | ~8M | 4 |
 | 8GB+ | 4+ | no | 6 | ~31M | 6 |
 | 16GB+ | 4+ | no | 8 | ~67M | 6 |
@@ -124,7 +123,6 @@ dim = depth * 64 (cap 768). head_dim = 64. GQA above 384. hidden = 1.5x per expe
 11. **meta-learns** from its own configuration choices
 12. tracks **calendar drift** — how far the present has drifted from the past
 13. if stagnating — **hunts for datasets** on HuggingFace (evaluates, accepts/rejects)
-14. if overloaded — **self-replicates** (compiles copy, forks, trains on different data)
 15. finetunes on `personality.txt` (optional but psychologically recommended)
 16. exports final GGUF, drops you into chat with a parliament
 
@@ -156,7 +154,7 @@ experts aren't weight matrices. they're organisms:
 - **age** (steps since birth — too young to die, too old to breed)
 
 overloaded + high vitality — **mitosis** (splits in two, child inherits weights + noise)
-neglected + 8 consecutive low-vitality steps — **apoptosis** (dies, weights freed, slot recycled)
+neglected + ~8 consecutive low-vitality steps (scaled by ephemeral mercy) — **apoptosis** (dies, weights freed, slot recycled)
 
 min 2, max 16 experts per layer.
 
@@ -224,9 +222,10 @@ Hebbian training on LoRA only (no backward through host)
 
 the host provides weights. DOE provides direction.
 
-any architecture, any quantization, any layout: RoPE is arch-gated, with a
+standard-FFN transformers (the llama / mistral / qwen family) in the common GGUF
+quant types (f16, Q4_0/Q5_0/Q8_0, Q4_K, Q6_K): RoPE is arch-gated, with a
 per-GGUF `--rope-neox` / `--rope-norm` override for files whose layout doesn't
-match what `general.architecture` claims.
+match what `general.architecture` claims. (MoE hosts and unlisted dtypes are rejected.)
 
 ### code-aware tokenizer
 
@@ -236,14 +235,6 @@ tracks `code_ratio` — feeds into ephemeral config: code — more layers, highe
 ### dataset hunter
 
 when DOE stagnates (loss plateau + low drift + bad data quality), it searches HuggingFace API. downloads sample, evaluates quality via parser_eye, accepts or rejects. triggered every 500 steps. disabled when `--data` is provided.
-
-### self-replication
-
-DOE can `fork()`:
-- compiles a copy of itself
-- max 2 replicas (population control)
-- each gets different data
-- results merge via mycelium
 
 ## GPU acceleration
 
