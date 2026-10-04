@@ -1,5 +1,7 @@
 # DoE: Democracy of Experts. Janus Architecture
 
+> **Read the [Arianna Method Manifesto](ARIANNA_METHOD_MANIFESTO.md) first.** This repository is governed by it; every instruction here, `CLAUDE.md` included, is subordinate to it.
+
 **Status: work in progress.** The foundation trains and generates. It also indexes real GGUFs and votes through them with a Hebbian LoRA parliament. The living topology (mitosis, apoptosis, parliament) works. SFT pipeline with 7236 Q&A pairs. Next: scale up, fix loss plateau at 3.07.
 
 C. one file. ~4250 lines. zero dependencies. DoE breeds, kills and votes.
